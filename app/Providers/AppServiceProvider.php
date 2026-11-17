@@ -1,0 +1,237 @@
+<?php
+
+namespace App\Providers;
+
+use App\Auth\PasskeyLoginResponse;
+use App\Classes\Synths\PriceSynth;
+use App\Exceptions\ErrorHandler;
+use App\Helpers\ExtensionHelper;
+use App\Http\Requests\Auth\PasskeyVerificationRequest;
+use App\Models\EmailLog;
+use App\Models\Extension;
+use App\Models\OauthClient;
+use App\Models\User;
+use App\Support\Passport\ScopeRegistry;
+use Closure;
+use Dedoc\Scramble\Scramble;
+use Dedoc\Scramble\Support\Generator\OpenApi;
+use Dedoc\Scramble\Support\Generator\SecurityScheme;
+use Exception;
+use Illuminate\Auth\Access\Response;
+use Illuminate\Foundation\Exceptions\Handler;
+use Illuminate\Http\Request;
+use Illuminate\Mail\SendQueuedMailable;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessed;
+use Illuminate\Routing\UrlGenerator;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Route;
+use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Str;
+use Laravel\Passkeys\Contracts\PasskeyLoginResponse as PasskeyLoginResponseContract;
+use Laravel\Passkeys\Http\Requests\PasskeyVerificationRequest as BasePasskeyVerificationRequest;
+use Laravel\Passport\Passport;
+use League\CommonMark\Extension\Table\TableExtension;
+use Livewire\Livewire;
+use SocialiteProviders\Discord\Provider;
+use SocialiteProviders\Manager\SocialiteWasCalled;
+
+class AppServiceProvider extends ServiceProvider
+{
+    /**
+     * Register any application services.
+     */
+    public function register(): void
+    {
+        // Service provider for settings
+        $this->app->register(SettingsProvider::class);
+        $this->app->singleton(PasskeyLoginResponseContract::class, PasskeyLoginResponse::class);
+        $this->app->bind(BasePasskeyVerificationRequest::class, PasskeyVerificationRequest::class);
+
+        UrlGenerator::macro('alternateHasCorrectSignature', function (Request $request, $absolute = true, Closure|array $ignoreQuery = []) {
+            // ensure the base path is applied to absolute url
+            $absoluteUrl = url($request->path()); // forceRootUrl and forceScheme will apply
+            $url = $absolute ? $absoluteUrl : '/' . $request->path();
+
+            $queryString = collect(explode('&', (string) $request->server->get('QUERY_STRING')))
+                ->reject(function ($parameter) use ($ignoreQuery) {
+                    $parameter = Str::before($parameter, '=');
+
+                    if ($parameter === 'signature') {
+                        return true;
+                    }
+
+                    if ($ignoreQuery instanceof Closure) {
+                        return $ignoreQuery($parameter);
+                    }
+
+                    return in_array($parameter, $ignoreQuery);
+                })
+                ->join('&');
+
+            $original = rtrim($url . '?' . $queryString, '?');
+
+            $keys = call_user_func($this->keyResolver);
+
+            $keys = is_array($keys) ? $keys : [$keys];
+
+            foreach ($keys as $key) {
+                if (
+                    hash_equals(
+                        hash_hmac('sha256', $original, $key),
+                        (string) $request->query('signature', '')
+                    )
+                ) {
+                    return true;
+                }
+            }
+
+            return false;
+        });
+
+        UrlGenerator::macro('alternateHasValidSignature', function (Request $request, $absolute = true, array $ignoreQuery = []) {
+            return \URL::alternateHasCorrectSignature($request, $absolute, $ignoreQuery)
+                && \URL::signatureHasNotExpired($request);
+        });
+
+        Request::macro('hasValidSignature', function ($absolute = true, array $ignoreQuery = []) {
+            return \URL::alternateHasValidSignature($this, $absolute, $ignoreQuery);
+        });
+
+        Request::macro('livewireUrl', function () {
+            // Somehow people manage to have no route
+            $route = request()->route();
+
+            if ($route && $route->named('paymenter.livewire.update')) {
+                $previousUrl = url()->previous();
+
+                return $previousUrl !== null ? $previousUrl : request()->fullUrl();
+            }
+
+            return request()->fullUrl();
+        });
+
+        Request::macro('livewireRoute', function () {
+            // Return name of current route
+            if (request()->route()->named('paymenter.livewire.update')) {
+                $previousUrl = url()->previous();
+
+                if ($previousUrl !== null) {
+                    $previousRequest = \Route::getRoutes()->match(request()->create($previousUrl));
+                    if ($previousRequest) {
+                        return $previousRequest->getName();
+                    }
+                }
+
+                return 'paymenter.livewire.update';
+            }
+
+            return request()->route()->getName();
+        });
+
+        $this->app->singleton(Handler::class, function ($app) {
+            return new ErrorHandler($app);
+        });
+
+    }
+
+    /**
+     * Bootstrap any application services.
+     */
+    public function boot(): void
+    {
+        // Change livewire url
+        Livewire::setUpdateRoute(function ($handle) {
+            return Route::post('/paymenter/update', $handle)->middleware('web')->name('paymenter.');
+        });
+        Livewire::propertySynthesizer(PriceSynth::class);
+
+        Gate::define('has-permission', function (User $user, string $ability) {
+            return $user->hasPermission($ability);
+        });
+
+        Event::listen(function (SocialiteWasCalled $event) {
+            $event->extendSocialite('discord', Provider::class);
+        });
+
+        Gate::defaultDenialResponse(Response::denyAsNotFound());
+
+        try {
+            $extensions = Extension::query()
+                ->where(fn ($query) => $query
+                    ->where('enabled', true)
+                    ->orWhereIn('type', ['server', 'gateway']))
+                ->get(['id', 'extension', 'type'])
+                ->unique('extension');
+
+            $extensions->load('settings');
+
+            foreach ($extensions as $extension) {
+                ExtensionHelper::call($extension, 'boot', mayFail: true);
+            }
+        } catch (Exception $e) {
+            // Fail silently
+        }
+
+        // resolveName() returns the mailable's class for queued mail, so match the job wrapper instead
+        // and update the log of any mailable that carries an email_log_id (Mail, SystemMail, ...)
+        $updateEmailLog = function ($job, array $attributes) {
+            $payload = $job->payload();
+
+            if (($payload['data']['commandName'] ?? null) !== SendQueuedMailable::class) {
+                return;
+            }
+
+            try {
+                $mailable = unserialize($payload['data']['command'])->mailable;
+            } catch (\Throwable  $e) {
+                return;
+            }
+
+            if (empty($mailable->email_log_id)) {
+                return;
+            }
+
+            EmailLog::where('id', $mailable->email_log_id)->update($attributes);
+        };
+
+        Queue::after(function (JobProcessed $event) use ($updateEmailLog) {
+            $updateEmailLog($event->job, [
+                'sent_at' => now(),
+                'status' => 'sent',
+            ]);
+        });
+        Queue::failing(function (JobFailed $event) use ($updateEmailLog) {
+            $updateEmailLog($event->job, [
+                'status' => 'failed',
+                'error' => $event->exception->getMessage(),
+                'job_uuid' => $event->job->uuid(),
+            ]);
+        });
+
+        Str::macro('markdown', function ($markdown) {
+            return Str::markdown($markdown, extensions: [
+                new TableExtension,
+            ]);
+        });
+        Passport::useClientModel(OauthClient::class);
+        Passport::ignoreRoutes();
+        Passport::tokensCan(ScopeRegistry::getAll());
+        Passport::authorizationView('vendor.passport.authorize');
+        Passport::$validateKeyPermissions = false;
+
+        if (class_exists(Scramble::class)) {
+            Scramble::configure()
+                ->routes(function (\Illuminate\Routing\Route $route) {
+                    return Str::startsWith($route->uri, 'api/v1/admin');
+                })
+                ->withDocumentTransformers(function (OpenApi $openApi) {
+                    $openApi->secure(
+                        SecurityScheme::http('bearer')
+                    );
+                });
+        }
+    }
+}
